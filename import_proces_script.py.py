@@ -599,8 +599,8 @@ def main():
         print(df_output.tail())
         
         # Extract date range from the data for dynamic filename
-        min_date = df_output['datetime'].min().strftime('%Y-%m-%d')
-        max_date = df_output['datetime'].max().strftime('%Y-%m-%d')
+        min_date = df_output['datetime'].min().strftime('%Y%m%d')
+        max_date = df_output['datetime'].max().strftime('%Y%m%d')
         
         # Validate the output data
         validation_results = validate_output_data(df_output)
