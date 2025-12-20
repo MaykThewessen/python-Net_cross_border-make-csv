@@ -113,12 +113,18 @@ print(f'Start date: {start}')
 print(f'End date:   {end}')
 
 # Define neighboring countries for Netherlands cross-border flows
+# Only countries with direct physical interconnections
 neighboring_countries = {
     'BE': 'Belgium',
     'DE': 'Germany',
-    'DK_1': 'Denmark (DK1)',
+    'DK_1': 'Denmark (DK1)',  # COBRAcable went live Sept 2019
     'GB': 'Great Britain',
     'NO_2': 'Norway (NO2)'
+}
+
+# Country-specific start dates (for cables that went live after 2018)
+country_start_dates = {
+    'DK_1': pd.Timestamp('20190801', tz='Europe/Amsterdam'),  # COBRAcable live Sept 2019, start from Aug 2019
 }
 
 # Fetch Cross-Border Physical Flows data from ENTSO-E in chunks
@@ -322,9 +328,15 @@ try:
     total_borders = len(neighboring_countries) * 2  # 2 directions per country
 
     for country_to, country_name in neighboring_countries.items():
+        # Use country-specific start date if available
+        country_start = country_start_dates.get(country_to, start)
+
+        if country_start != start:
+            print(f"\n  ℹ️  {country_name}: Using custom start date {country_start.strftime('%Y-%m-%d')} (cable went live later)")
+
         border_count += 1
         print(f"\n  [{border_count}/{total_borders}] Fetching NL -> {country_name}...")
-        flow_export = fetch_crossborder_flows_in_chunks('NL', country_to, start, end)
+        flow_export = fetch_crossborder_flows_in_chunks('NL', country_to, country_start, end)
         if flow_export is not None:
             all_flows[f'exp_{country_to}'] = flow_export
             export_rows = len(flow_export)
@@ -338,7 +350,7 @@ try:
 
         border_count += 1
         print(f"  [{border_count}/{total_borders}] Fetching {country_name} -> NL...")
-        flow_import = fetch_crossborder_flows_in_chunks(country_to, 'NL', start, end)
+        flow_import = fetch_crossborder_flows_in_chunks(country_to, 'NL', country_start, end)
         if flow_import is not None:
             all_flows[f'imp_{country_to}'] = flow_import
             import_rows = len(flow_import)
@@ -369,18 +381,16 @@ print(f"{'='*60}\n")
 hourly_countries = []
 if country_row_counts:
     print("Detecting data frequency per country:")
-
-    # Calculate expected row counts based on time range
-    days_requested = (end - start).days
-    expected_hourly = days_requested * 24
-    expected_quarterly = days_requested * 24 * 4  # 15-minute = 4 per hour
-
-    print(f"  Time range: {days_requested} days ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})")
-    print(f"  Expected rows: {expected_hourly} (hourly) or {expected_quarterly} (15-minute)")
     print()
 
     for country, counts in country_row_counts.items():
         avg_count = sum(counts) / len(counts) if counts else 0
+
+        # Use country-specific start date for calculating expected rows
+        country_start = country_start_dates.get(country, start)
+        days_requested = (end - country_start).days
+        expected_hourly = days_requested * 24
+        expected_quarterly = days_requested * 24 * 4  # 15-minute = 4 per hour
 
         # Calculate distance to expected values
         dist_to_hourly = abs(avg_count - expected_hourly)
@@ -389,9 +399,9 @@ if country_row_counts:
         # Determine which is closer
         if dist_to_hourly < dist_to_quarterly:
             hourly_countries.append(country)
-            print(f"  {country}: {int(avg_count)} rows → HOURLY data detected (expected ~{expected_hourly})")
+            print(f"  {country}: {int(avg_count)} rows → HOURLY data detected (expected ~{expected_hourly} for {days_requested} days)")
         else:
-            print(f"  {country}: {int(avg_count)} rows → 15-minute data (expected ~{expected_quarterly})")
+            print(f"  {country}: {int(avg_count)} rows → 15-minute data (expected ~{expected_quarterly} for {days_requested} days)")
 
     if hourly_countries:
         print(f"\n  ℹ️  Countries with hourly data: {', '.join(hourly_countries)}")
