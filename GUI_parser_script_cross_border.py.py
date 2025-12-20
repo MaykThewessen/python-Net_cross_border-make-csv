@@ -606,7 +606,7 @@ def main():
         validation_results = validate_output_data(df_output)
         
         # Save df_output to CSV with descriptive filename using actual date range
-        output_filename = f"netCrossBorderExchangeNL_{min_date}_{max_date}.csv"
+        output_filename = f"netCrossBorderExchangeNL_{min_date}_{max_date}_MW_positive_import.csv"
         df_output.to_csv(output_filename, index=False)
         print(f"\n✓ df_output saved as '{output_filename}'")
         
