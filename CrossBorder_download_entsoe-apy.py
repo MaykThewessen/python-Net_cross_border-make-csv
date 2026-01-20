@@ -85,19 +85,48 @@ if existing_files:
         historical_data = historical_data.set_index('datetime')
 
         last_date = historical_data.index.max()
+        first_date = historical_data.index.min()
         print(f"  Existing data: {len(historical_data)} rows")
-        print(f"    Date range: {historical_data.index.min().strftime('%Y-%m-%d %H:%M')} to {last_date.strftime('%Y-%m-%d %H:%M')}")
+        print(f"    Date range: {first_date.strftime('%Y-%m-%d %H:%M')} to {last_date.strftime('%Y-%m-%d %H:%M')}")
 
-        # Start fetching from the next hour after the last existing data
-        start = last_date + pd.Timedelta(hours=1)
-        print(f"\n  → Will fetch NEW data from {start.strftime('%Y-%m-%d %H:%M')} onwards")
+        # ------------------------------------------------------------------
+        # VALIDATE HISTORICAL NET DATA (row count & gaps)
+        # If validation fails, discard historical_data and refetch from 2018
+        # ------------------------------------------------------------------
+        time_diffs_hist = historical_data.index.to_series().diff()
+        most_common_freq_hist = time_diffs_hist.mode()[0]
+        is_15min_hist = most_common_freq_hist == pd.Timedelta(minutes=15)
+        is_hourly_hist = most_common_freq_hist == pd.Timedelta(hours=1)
 
-        # If the existing data is already up to date, skip fetching
-        if start >= end:
-            print(f"\n✓ Data is already up to date! No new data to fetch.")
-            print(f"  Latest data: {last_date.strftime('%Y-%m-%d %H:%M')}")
-            print(f"  Current time: {end.strftime('%Y-%m-%d %H:%M')}")
-            exit(0)
+        if is_15min_hist:
+            expected_intervals_hist = int((last_date - first_date).total_seconds() / 900) + 1
+            expected_freq_hist = pd.Timedelta(minutes=15)
+        else:
+            expected_intervals_hist = int((last_date - first_date).total_seconds() / 3600) + 1
+            expected_freq_hist = pd.Timedelta(hours=1)
+
+        actual_rows_hist = len(historical_data)
+        gaps_hist = time_diffs_hist[time_diffs_hist != expected_freq_hist].dropna()
+
+        if actual_rows_hist != expected_intervals_hist or len(gaps_hist) > 0:
+            print("\n  ⚠️  Detected gaps or inconsistent row count in existing net CSV.")
+            print(f"     Expected intervals: {expected_intervals_hist}, actual rows: {actual_rows_hist}")
+            print(f"     Gaps found: {len(gaps_hist)}")
+            print("     → Discarding historical net data and refetching from 2018-01-01 for a clean series.")
+            historical_data = None
+            start = pd.Timestamp('20180101', tz='Europe/Amsterdam')
+        else:
+            # Start fetching from the next hour after the last existing data
+            start = last_date + pd.Timedelta(hours=1)
+            print(f"\n  → Historical net data is consistent.")
+            print(f"  → Will fetch NEW data from {start.strftime('%Y-%m-%d %H:%M')} onwards")
+
+            # If the existing data is already up to date, skip fetching
+            if start >= end:
+                print(f"\n✓ Data is already up to date! No new data to fetch.")
+                print(f"  Latest data: {last_date.strftime('%Y-%m-%d %H:%M')}")
+                print(f"  Current time: {end.strftime('%Y-%m-%d %H:%M')}")
+                exit(0)
 
     except Exception as e:
         print(f"  ⚠️  Error reading existing file: {e}")
@@ -127,6 +156,43 @@ if existing_detailed_files:
 
         print(f"  Detailed historical data: {len(historical_detailed_data)} rows")
         print(f"    Columns: {list(historical_detailed_data.columns)}")
+
+        # ------------------------------------------------------------------
+        # VALIDATE HISTORICAL DETAILED DATA (row count, gaps, country columns)
+        # If validation fails, discard and refetch detailed data from 2018.
+        # ------------------------------------------------------------------
+        first_det = historical_detailed_data.index.min()
+        last_det = historical_detailed_data.index.max()
+        time_diffs_det = historical_detailed_data.index.to_series().diff()
+        most_common_freq_det = time_diffs_det.mode()[0]
+        is_15min_det = most_common_freq_det == pd.Timedelta(minutes=15)
+        if is_15min_det:
+            expected_intervals_det = int((last_det - first_det).total_seconds() / 900) + 1
+            expected_freq_det = pd.Timedelta(minutes=15)
+        else:
+            expected_intervals_det = int((last_det - first_det).total_seconds() / 3600) + 1
+            expected_freq_det = pd.Timedelta(hours=1)
+
+        actual_rows_det = len(historical_detailed_data)
+        gaps_det = time_diffs_det[time_diffs_det != expected_freq_det].dropna()
+
+        # Check that all configured non-BE countries have both imp_/exp_ columns
+        expected_countries = [cc for cc in neighboring_countries.keys() if cc != 'BE']
+        expected_cols = []
+        for cc in expected_countries:
+            col_code = country_code_to_column_name.get(cc, cc)
+            expected_cols.extend([f'imp_{col_code}', f'exp_{col_code}'])
+
+        missing_cols = [c for c in expected_cols if c not in historical_detailed_data.columns]
+
+        if actual_rows_det != expected_intervals_det or len(gaps_det) > 0 or missing_cols:
+            print("\n  ⚠️  Detected issues in existing detailed CSV:")
+            print(f"     Expected intervals: {expected_intervals_det}, actual rows: {actual_rows_det}")
+            print(f"     Gaps found: {len(gaps_det)}")
+            if missing_cols:
+                print(f"     Missing expected country columns: {missing_cols}")
+            print("     → Discarding historical detailed data and refetching from 2018-01-01.")
+            historical_detailed_data = None
 
     except Exception as e:
         print(f"  ⚠️  Error reading existing detailed file: {e}")
@@ -471,6 +537,61 @@ def fetch_crossborder_flows_in_chunks(in_domain_eic, out_domain_eic, area_from_n
     else:
         return None
 
+
+def _fill_quarters_from_hour_start_if_sparse(series: pd.Series, *, label: str) -> pd.Series:
+    """
+    Some ENTSO-E borders can occasionally return 15-minute series where only the
+    first quarter (:00) has the hour's value and the remaining quarters are 0.
+    If detected, copy the :00 value into :15/:30/:45 within the same hour.
+    """
+    if series is None or len(series) == 0:
+        return series
+
+    # Only applies to 15-minute indexed data
+    idx = series.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        return series
+
+    # Fast exit if we don't even have quarter-hour stamps
+    if not (idx.minute.isin([0, 15, 30, 45]).all() and len(series) >= 8):
+        return series
+
+    # Heuristic detection:
+    # If a large share of non-zero values occur at :00 while :15/:30/:45 are mostly zero,
+    # treat zeros in those quarters as "missing" and fill within the hour.
+    minutes = idx.minute
+    nonzero = series.ne(0) & series.notna()
+    nz_00 = int(nonzero[minutes == 0].sum())
+    nz_other = int(nonzero[minutes.isin([15, 30, 45])].sum())
+    if nz_00 == 0:
+        return series
+
+    # If other quarters almost never have non-zero values compared to :00,
+    # assume sparse-quarter encoding.
+    if nz_other > max(3, int(nz_00 * 0.10)):
+        return series
+
+    print(f"  ℹ️  Detected sparse 15-min quarters for {label}. Filling :15/:30/:45 from :00 within each hour...")
+
+    hour = idx.floor("h")
+    s = series.copy()
+    for h, g in s.groupby(hour):
+        # Expect up to 4 samples per hour; if :00 isn't present, skip
+        g = g.sort_index()
+        if len(g) < 2:
+            continue
+        if g.index[0].minute != 0:
+            continue
+        base = g.iloc[0]
+        if pd.isna(base) or base == 0:
+            continue
+        # Replace zeros in remaining quarters with base
+        mask = (g.index.minute != 0) & (g == 0)
+        if mask.any():
+            s.loc[g.index[mask]] = base
+    return s
+
+
 _stop_event = threading.Event()
 _spinner_thread = threading.Thread(target=_spinner, args=(_stop_event,), daemon=True)
 _spinner_thread.start()
@@ -736,10 +857,18 @@ if all_flows:
     else:
         print(f"  ✓ Data is at hourly resolution")
 
+    # ============================================================================
+    # OPTIONAL FIX: some borders encode hourly values only at :00 (rest quarters=0)
+    # ============================================================================
+    quarter_fill_countries = ["NO_2"]
+    quarter_fill_cols = [c for c in combined_df.columns if any(c.endswith(cc) for cc in quarter_fill_countries)]
+    for col in quarter_fill_cols:
+        combined_df[col] = _fill_quarters_from_hour_start_if_sparse(combined_df[col], label=col)
+
     # Fill any remaining NaN values with 0 (no flow)
     combined_df = combined_df.fillna(0)
 
-    # Separate import and export columns
+    # Separate import and export columns (after dropping unwanted countries)
     import_cols = [col for col in combined_df.columns if col.startswith('imp_')]
     export_cols = [col for col in combined_df.columns if col.startswith('exp_')]
 
@@ -926,26 +1055,13 @@ if all_flows:
                 belgium_export = belgium_export.reindex(complete_15min_index, method='ffill')
                 print(f"  ✓ Converted to 15-minute resolution: {len(belgium_import)} rows")
             
-            # Align Belgium data with combined_df index
-            # Find overlapping time range
-            overlap_start = max(combined_df.index.min(), belgium_import.index.min())
-            overlap_end = min(combined_df.index.max(), belgium_import.index.max())
+            # Align Belgium data with combined_df index using an INNER overlap
+            # Only timestamps present in BOTH series are used (inner merge behaviour)
+            overlap_index = combined_df.index.intersection(belgium_import.index)
             
-            if overlap_start <= overlap_end:
-                print(f"\n  Overwriting Belgium columns in combined_df...")
-                print(f"    Overlap range: {overlap_start.strftime('%Y-%m-%d %H:%M')} to {overlap_end.strftime('%Y-%m-%d %H:%M')}")
-                
-                # Create aligned series for the overlap period
-                # Use forward fill to align 15-minute data, then backward fill for any remaining gaps
-                belgium_import_aligned = belgium_import.reindex(combined_df.index, method='ffill')
-                belgium_import_aligned = belgium_import_aligned.bfill()
-                belgium_export_aligned = belgium_export.reindex(combined_df.index, method='ffill')
-                belgium_export_aligned = belgium_export_aligned.bfill()
-                
-                # Only overwrite where Belgium data exists (not NaN) and within overlap range
-                overlap_mask = (combined_df.index >= overlap_start) & (combined_df.index <= overlap_end)
-                mask_import = overlap_mask & ~belgium_import_aligned.isna()
-                mask_export = overlap_mask & ~belgium_export_aligned.isna()
+            if not overlap_index.empty:
+                print(f"\n  Overwriting Belgium columns in combined_df using INNER overlap...")
+                print(f"    Overlap range: {overlap_index.min().strftime('%Y-%m-%d %H:%M')} to {overlap_index.max().strftime('%Y-%m-%d %H:%M')}")
                 
                 # Ensure columns exist
                 if 'imp_BE' not in combined_df.columns:
@@ -953,12 +1069,12 @@ if all_flows:
                 if 'exp_BE' not in combined_df.columns:
                     combined_df['exp_BE'] = 0
                 
-                # Overwrite Belgium columns
-                combined_df.loc[mask_import, 'imp_BE'] = belgium_import_aligned[mask_import].astype(int)
-                combined_df.loc[mask_export, 'exp_BE'] = belgium_export_aligned[mask_export].astype(int)
+                # Overwrite Belgium columns only on shared timestamps (no ffill/bfill)
+                combined_df.loc[overlap_index, 'imp_BE'] = belgium_import.loc[overlap_index].astype(int)
+                combined_df.loc[overlap_index, 'exp_BE'] = belgium_export.loc[overlap_index].astype(int)
                 
-                overwritten_count = mask_import.sum()
-                print(f"  ✓ Overwritten {overwritten_count} rows for Belgium import/export")
+                overwritten_count = len(overlap_index)
+                print(f"  ✓ Overwritten {overwritten_count} rows for Belgium import/export (inner merge)")
                 
                 # Recalculate totals after overwriting Belgium data
                 print(f"\n  Recalculating totals after Belgium data update...")
@@ -1199,43 +1315,11 @@ if all_flows:
     output_start = crossborder_data.index.min()
     output_end = crossborder_data.index.max()
 
-    # ============================================================================
-    # SAVE EXTENDED VERSION (15-minute resolution)
-    # ============================================================================
-    output_filename_extended = f'netCrossBorderExchangeNL_{output_start.strftime("%Y%m%d")}_{output_end.strftime("%Y%m%d")}_MW_positive_import_extended.csv'
-    output_file_extended = os.path.join(output_dir, output_filename_extended)
-
-    # Reset index to save datetime as column
+    # NOTE: netCrossBorderExchangeNL CSV exports (extended/hourly) are no longer saved
+    # to avoid creating the *_MW_positive_import_extended.csv and *_MW_positive_import_hourly.csv files.
     crossborder_data_to_save = crossborder_data.copy()
     crossborder_data_to_save.index.name = 'datetime'
     crossborder_data_to_save = crossborder_data_to_save.reset_index()
-
-    print(f"Saving EXTENDED cross-border exchange data (15-minute)...")
-    print(f"  File: {output_filename_extended}")
-    print(f"  Dataset: {len(crossborder_data_to_save)} rows ({interval_type})")
-    print(f"  Date range: {output_start.strftime('%Y-%m-%d %H:%M')} to {output_end.strftime('%Y-%m-%d %H:%M')}")
-    crossborder_data_to_save.to_csv(output_file_extended, index=False)
-    print(f"✓ Extended data saved successfully!")
-    print(f"  File location: {output_file_extended}")
-
-    # ============================================================================
-    # SAVE HOURLY VERSION (resampled to hourly mean)
-    # ============================================================================
-    print(f"\nCreating HOURLY version (resampling to hourly mean)...")
-    crossborder_hourly = crossborder_data.resample('h').mean().round(0).astype(int)
-
-    output_filename_hourly = f'netCrossBorderExchangeNL_{output_start.strftime("%Y%m%d")}_{output_end.strftime("%Y%m%d")}_MW_positive_import_hourly.csv'
-    output_file_hourly = os.path.join(output_dir, output_filename_hourly)
-
-    crossborder_hourly_to_save = crossborder_hourly.copy()
-    crossborder_hourly_to_save.index.name = 'datetime'
-    crossborder_hourly_to_save = crossborder_hourly_to_save.reset_index()
-
-    print(f"  File: {output_filename_hourly}")
-    print(f"  Dataset: {len(crossborder_hourly_to_save)} rows (hourly)")
-    crossborder_hourly_to_save.to_csv(output_file_hourly, index=False)
-    print(f"✓ Hourly data saved successfully!")
-    print(f"  File location: {output_file_hourly}")
 
     # ============================================================================
     # SAVE DETAILED DATA - EXTENDED VERSION (15-minute resolution)
@@ -1261,30 +1345,6 @@ if all_flows:
     print(f"✓ Extended detailed data saved successfully!")
     print(f"  File location: {detailed_file_extended}")
 
-    # ============================================================================
-    # SAVE DETAILED DATA - HOURLY VERSION (resampled to hourly mean)
-    # ============================================================================
-    print(f"\nCreating HOURLY detailed data (resampling to hourly mean)...")
-    detailed_hourly = combined_df.resample('h').mean().round(0).astype(int)
-
-    detailed_filename_hourly = f'CrossBorder_detailed_{output_start.strftime("%Y%m%d")}_{output_end.strftime("%Y%m%d")}_MW_hourly.csv'
-    detailed_file_hourly = os.path.join(output_dir, detailed_filename_hourly)
-
-    detailed_hourly_to_save = detailed_hourly.copy()
-    detailed_hourly_to_save.index.name = 'datetime'
-    detailed_hourly_to_save = detailed_hourly_to_save.reset_index()
-
-    # Convert all numeric columns to integers
-    numeric_cols_hourly = detailed_hourly_to_save.select_dtypes(include=['float64', 'float32']).columns
-    for col in numeric_cols_hourly:
-        detailed_hourly_to_save[col] = detailed_hourly_to_save[col].astype(int)
-
-    print(f"  File: {detailed_filename_hourly}")
-    print(f"  Dataset: {len(detailed_hourly_to_save)} rows, {len(detailed_hourly_to_save.columns)} columns")
-    detailed_hourly_to_save.to_csv(detailed_file_hourly, index=False)
-    print(f"✓ Hourly detailed data saved successfully!")
-    print(f"  File location: {detailed_file_hourly}")
-
     # Print sample of data
     print("\n" + "="*60)
     print("DATA SAMPLE - Net Exchange EXTENDED (15-minute, first 7 rows)")
@@ -1292,27 +1352,15 @@ if all_flows:
     print(crossborder_data_to_save.head(7))
 
     print("\n" + "="*60)
-    print("DATA SAMPLE - Net Exchange HOURLY (first 7 rows)")
-    print("="*60)
-    print(crossborder_hourly_to_save.head(7))
-
-    print("\n" + "="*60)
     print("DATA SAMPLE - Detailed EXTENDED (15-minute, first 7 rows)")
     print("="*60)
     print(detailed_data_to_save.head(7))
 
     print("\n" + "="*60)
-    print("DATA SAMPLE - Detailed HOURLY (first 7 rows)")
-    print("="*60)
-    print(detailed_hourly_to_save.head(7))
-
-    print("\n" + "="*60)
     print("FILES SAVED SUMMARY")
     print("="*60)
-    print(f"✓ Net Exchange Extended: {output_filename_extended}")
-    print(f"✓ Net Exchange Hourly:   {output_filename_hourly}")
+    print(f"✓ Net Exchange Extended (in-memory only)")
     print(f"✓ Detailed Extended:     {detailed_filename_extended}")
-    print(f"✓ Detailed Hourly:       {detailed_filename_hourly}")
 
     print("\n" + "="*60)
     print("SCRIPT COMPLETED SUCCESSFULLY")
