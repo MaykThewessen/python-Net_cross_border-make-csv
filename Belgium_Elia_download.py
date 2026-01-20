@@ -24,7 +24,7 @@ print(f"\nOutput directory: {output_dir}")
 # Data available from 2015 onwards, but 15-minute data quality improves over time
 # Start from 2018 to match the other datasets in the project
 default_start = pd.Timestamp('20180101', tz='Europe/Brussels')
-end = pd.Timestamp.now(tz='Europe/Brussels').floor('15min')
+end = pd.Timestamp.now(tz='Europe/Brussels').floor('15min')  # Retrieve data up to last 15-minute interval
 
 # Check for existing CSV files
 print("\nChecking for existing Belgium data files...")
@@ -166,7 +166,9 @@ def fetch_elia_data(start_dt, end_dt, limit=100, max_retries=3):
         # Elia API v2.1 structure: each result contains fields directly
         processed_data.append({
             'datetime': record.get('datetime'),
-            'flow_MW': record.get('physicalflowatborder'),  # MW, positive = export from BE
+            # physicalflowatborder: Positive = Belgium EXPORTS to NL (= NL imports from BE)
+            #                       Negative = Belgium IMPORTS from NL (= NL exports to BE)
+            'flow_MW': record.get('physicalflowatborder'),
             'control_area': record.get('controlarea')
         })
 
@@ -195,30 +197,54 @@ current_start = start
 total_months = ((end.year - start.year) * 12 + end.month - start.month) + 1
 current_month = 0
 
+# Track timing for ETA
+loop_start_time = time.time()
+first_chunk_completed = False
+
 # Calculate monthly chunks
-while current_start < end:
-    current_month += 1
-    # Fetch one month at a time
-    chunk_end = min(current_start + pd.DateOffset(months=1), end)
+try:
+    while current_start < end:
+        current_month += 1
+        # Fetch one month at a time
+        chunk_end = min(current_start + pd.DateOffset(months=1), end)
 
-    progress_pct = (current_month / total_months) * 100
-    print(f"\n📅 Chunk {current_month}/{total_months} ({progress_pct:.1f}%): {current_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}")
+        progress_pct = (current_month / total_months) * 100
+        print(f"\n📅 Chunk {current_month}/{total_months} ({progress_pct:.1f}%): {current_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}")
 
-    try:
-        chunk_data = fetch_elia_data(current_start, chunk_end, limit=100)
+        try:
+            chunk_data = fetch_elia_data(current_start, chunk_end, limit=100)
+            print(chunk_data)  # Debug: show chunk data structure
 
-        if not chunk_data.empty:
-            all_data.append(chunk_data)
-            print(f"  ✓ Retrieved {len(chunk_data)} records")
-        else:
-            print(f"  ℹ️  No data available for this period")
+            if not chunk_data.empty:
+                all_data.append(chunk_data)
+                print(f"  ✓ Retrieved {len(chunk_data)} records")
+                
+                # Estimate remaining time after first chunk
+                if not first_chunk_completed:
+                    first_chunk_completed = True
+                    elapsed_first = time.time() - loop_start_time
+                    remaining_chunks = total_months - current_month
+                    estimated_total_secs = elapsed_first * total_months
+                    estimated_remaining_secs = estimated_total_secs - elapsed_first
+                    hours, remainder = divmod(estimated_remaining_secs, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    print(f"  ⏱️  First chunk took {elapsed_first:.1f}s; estimating ~{int(hours)}h {int(minutes)}m {int(seconds)}s remaining")
+            else:
+                print(f"  ℹ️  No data available for this period")
 
-    except Exception as e:
-        print(f"  ❌ Error fetching chunk: {e}")
-        print(f"  → Skipping this chunk and continuing...")
+        except Exception as e:
+            print(f"  ❌ Error fetching chunk: {e}")
+            print(f"  → Skipping this chunk and continuing...")
 
-    current_start = chunk_end
-    time.sleep(0.01)  # Rate limiting between chunks
+        current_start = chunk_end
+        time.sleep(0.01)  # Rate limiting between chunks
+
+except KeyboardInterrupt:
+    print(f"\n\n⚠️  Script interrupted by user!")
+    print(f"Saving partial data collected so far...")
+except Exception as e:
+    print(f"\n\n❌ Critical error occurred: {e}")
+    print(f"Saving partial data collected so far...")
 
 # Combine all chunks
 if all_data:
@@ -229,14 +255,26 @@ if all_data:
     print(f"✓ Successfully retrieved {len(new_data)} new records")
     print(f"  Date range: {new_data.index.min().strftime('%Y-%m-%d %H:%M')} to {new_data.index.max().strftime('%Y-%m-%d %H:%M')}")
 
+    # Convert flow_MW to import_BE_NL_MW BEFORE combining with historical data
+    #
+    # SIGN CONVENTION (from Netherlands perspective):
+    # ================================================
+    # Positive value (+) = Belgium EXPORTS to NL  →  NL IMPORTS from Belgium
+    # Negative value (-) = Belgium IMPORTS from NL →  NL EXPORTS to Belgium
+    #
+    # Column name 'import_BE_NL_MW' means: Import from Belgium to Netherlands
+    # This matches ENTSO-E convention where positive = import to NL
+    new_data['import_BE_NL_MW'] = new_data['flow_MW']
+
     # Combine with historical data if available
     if historical_data is not None:
         print(f"\nCombining with historical data ({len(historical_data)} rows)...")
-        combined_data = pd.concat([historical_data, new_data])
+        # Only select import_BE_NL_MW column for concatenation
+        combined_data = pd.concat([historical_data[['import_BE_NL_MW']], new_data[['import_BE_NL_MW']]])
         combined_data = combined_data[~combined_data.index.duplicated(keep='last')].sort_index()
         print(f"  ✓ Total combined records: {len(combined_data)}")
     else:
-        combined_data = new_data
+        combined_data = new_data[['import_BE_NL_MW']].copy()
 
     # Validate 15-minute frequency
     print("\nValidating data frequency...")
@@ -258,21 +296,25 @@ if all_data:
     if len(missing_timestamps) == 0 and len(extra_timestamps) == 0:
         print(f"  ✓ Perfect 15-minute frequency: {len(combined_data)} records")
 
-    # Convert flow from BE perspective to NL perspective
-    # Elia convention: positive = export from Belgium = import to NL
-    # Negative = import to Belgium = export from NL
-    # For consistency with ENTSO-E convention (positive = import to NL), we keep the sign as-is
-    combined_data['import_BE_NL_MW'] = combined_data['flow_MW']
-
-    # Prepare output
-    output_data = combined_data[['import_BE_NL_MW']].copy()
+    # Prepare output (import_BE_NL_MW already created earlier)
+    output_data = combined_data.copy()
     output_data = output_data.reset_index()
 
     # Convert timezone to Amsterdam for consistency with other data
     output_data['datetime'] = output_data['datetime'].dt.tz_convert('Europe/Amsterdam')
 
-    # Round to 0 decimals
-    output_data['import_BE_NL_MW'] = output_data['import_BE_NL_MW'].round(0).astype(int)
+    # Handle NaN and non-finite values properly
+    output_data['import_BE_NL_MW'] = pd.to_numeric(output_data['import_BE_NL_MW'], errors='coerce')
+    # Replace infinite values with NA
+    output_data['import_BE_NL_MW'] = output_data['import_BE_NL_MW'].replace([np.inf, -np.inf], pd.NA)
+
+    # Count and report missing values
+    n_missing = int(output_data['import_BE_NL_MW'].isna().sum())
+    if n_missing > 0:
+        print(f"  ⚠️  {n_missing} missing or non-finite flow values will remain as NA in the output")
+
+    # Round non-NA values and convert to nullable Int64 (which preserves NA values)
+    output_data['import_BE_NL_MW'] = output_data['import_BE_NL_MW'].round(0).astype('Int64')
 
     # Save to CSV
     output_start = output_data['datetime'].min()
@@ -282,6 +324,8 @@ if all_data:
 
     print(f"\n{'='*80}")
     print(f"Saving data to CSV...")
+    print(f"  SIGN CONVENTION: Positive (+) = Belgium exports to NL (NL imports from BE)")
+    print(f"                   Negative (-) = Belgium imports from NL (NL exports to BE)")
     output_data.to_csv(output_file_path, index=False)
     print(f"  ✓ Saved to: {output_filename}")
     print(f"  Total rows: {len(output_data)}")
@@ -290,10 +334,12 @@ if all_data:
 
     # Display sample statistics
     print("Sample statistics:")
-    print(f"  Mean flow: {output_data['import_BE_NL_MW'].mean():.0f} MW")
-    print(f"  Max import (to NL): {output_data['import_BE_NL_MW'].max():.0f} MW")
-    print(f"  Max export (from NL): {output_data['import_BE_NL_MW'].min():.0f} MW")
-    print(f"  Std deviation: {output_data['import_BE_NL_MW'].std():.0f} MW")
+    # Cast to float for aggregation to handle nullable integers (pd.NA)
+    series_float = output_data['import_BE_NL_MW'].astype(float)
+    print(f"  Mean flow: {series_float.mean():.0f} MW")
+    print(f"  Max import (to NL): {series_float.max():.0f} MW")
+    print(f"  Max export (from NL): {series_float.min():.0f} MW")
+    print(f"  Std deviation: {series_float.std():.0f} MW")
 
     print("\n✓ Script completed successfully!")
 
